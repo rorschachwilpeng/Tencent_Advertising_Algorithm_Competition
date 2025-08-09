@@ -7,7 +7,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-
 class MyDataset(torch.utils.data.Dataset):
     """
     用户序列数据集
@@ -53,6 +52,11 @@ class MyDataset(torch.utils.data.Dataset):
         self.indexer = indexer
 
         self.feature_default_value, self.feature_types, self.feat_statistics = self._init_feat_info()
+        
+        # 添加缓存优化
+        self._item_feat_cache = {}  # 物品特征缓存
+        self._mm_emb_lookup_cache = {}  # 多模态特征查找缓存
+        self._cache_stats = {'hits': 0, 'misses': 0}  # 缓存统计
 
     def _load_data_and_offsets(self):
         """
@@ -237,7 +241,7 @@ class MyDataset(torch.utils.data.Dataset):
 
     def fill_missing_feat(self, feat, item_id):
         """
-        对于原始数据中缺失的特征进行填充缺省值
+        对于原始数据中缺失的特征进行填充缺省值（缓存优化版本）
 
         Args:
             feat: 特征字典
@@ -246,6 +250,15 @@ class MyDataset(torch.utils.data.Dataset):
         Returns:
             filled_feat: 填充后的特征字典
         """
+        # 创建缓存键
+        cache_key = f"{item_id}_{hash(str(feat))}"
+        
+        # 检查缓存
+        if cache_key in self._item_feat_cache:
+            self._cache_stats['hits'] += 1
+            return self._item_feat_cache[cache_key]
+        self._cache_stats['misses'] += 1
+        
         if feat == None:
             feat = {}
         filled_feat = {}
@@ -256,14 +269,76 @@ class MyDataset(torch.utils.data.Dataset):
         for feat_type in self.feature_types.values():
             all_feat_ids.extend(feat_type)
         missing_fields = set(all_feat_ids) - set(feat.keys())
-        for feat_id in missing_fields:
+        for feat_id in missing_fields:#补充缺失的特征
             filled_feat[feat_id] = self.feature_default_value[feat_id]
+        
+        # 优化多模态特征查找
         for feat_id in self.feature_types['item_emb']:
-            if item_id != 0 and self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
-                if type(self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]) == np.ndarray:
-                    filled_feat[feat_id] = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+            if item_id != 0:
+                # 使用缓存的查找结果
+                lookup_key = f"{item_id}_{feat_id}"
+                if lookup_key in self._mm_emb_lookup_cache:
+                    mm_emb = self._mm_emb_lookup_cache[lookup_key]
+                else:
+                    # 执行查找并缓存结果
+                    if self.indexer_i_rev[item_id] in self.mm_emb_dict[feat_id]:
+                        mm_emb = self.mm_emb_dict[feat_id][self.indexer_i_rev[item_id]]
+                        if type(mm_emb) == np.ndarray:
+                            self._mm_emb_lookup_cache[lookup_key] = mm_emb
+                        else:
+                            mm_emb = None
+                    else:
+                        mm_emb = None
+                        self._mm_emb_lookup_cache[lookup_key] = None
+                
+                if mm_emb is not None:
+                    filled_feat[feat_id] = mm_emb
+
+        # 缓存结果
+        self._item_feat_cache[cache_key] = filled_feat
+        
+        # 限制缓存大小，防止内存溢出
+        if len(self._item_feat_cache) > 10000:
+            # 简单的LRU策略：删除最旧的20%缓存
+            keys_to_remove = list(self._item_feat_cache.keys())[:2000]
+            for key in keys_to_remove:
+                del self._item_feat_cache[key]
+        
+        if len(self._mm_emb_lookup_cache) > 50000:
+            # 限制多模态特征查找缓存大小
+            keys_to_remove = list(self._mm_emb_lookup_cache.keys())[:10000]
+            for key in keys_to_remove:
+                del self._mm_emb_lookup_cache[key]
 
         return filled_feat
+
+    def get_cache_stats(self):
+        """
+        获取缓存统计信息
+        
+        Returns:
+            dict: 包含缓存命中率、缓存大小等信息
+        """
+        total_requests = self._cache_stats['hits'] + self._cache_stats['misses']
+        hit_rate = self._cache_stats['hits'] / total_requests if total_requests > 0 else 0
+        
+        return {
+            'hit_rate': hit_rate,
+            'total_requests': total_requests,
+            'hits': self._cache_stats['hits'],
+            'misses': self._cache_stats['misses'],
+            'item_feat_cache_size': len(self._item_feat_cache),
+            'mm_emb_lookup_cache_size': len(self._mm_emb_lookup_cache)
+        }
+    
+    def clear_cache(self):
+        """
+        清空所有缓存
+        """
+        self._item_feat_cache.clear()
+        self._mm_emb_lookup_cache.clear()
+        self._cache_stats = {'hits': 0, 'misses': 0}
+        print("缓存已清空")
 
     @staticmethod
     def collate_fn(batch):
