@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import dataset as ds  # 用于获取多模态缓存统计
 from dataset import MyDataset
 from model import BaselineModel
 
@@ -97,16 +98,30 @@ if __name__ == '__main__':
     T = 0.0
     t0 = time.time()
     global_step = 0
+
+    # IO/Compute 统计
+    log_interval = 200
+    data_time_sum = 0.0
+    compute_time_sum = 0.0
+    t_data_wait_start = time.time()
+
     print("Start training")
     for epoch in range(epoch_start_idx, args.num_epochs + 1):
         model.train()
         if args.inference_only:
             break
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            # 统计数据获取时间（上一step结束到本step拿到batch的时间）
+            data_time = time.time() - t_data_wait_start
+            data_time_sum += data_time
+
             seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat = batch
             seq = seq.to(args.device)
             pos = pos.to(args.device)
             neg = neg.to(args.device)
+
+            # 前向与反向
+            compute_start = time.time()
             pos_logits, neg_logits = model(
                 seq, pos, neg, token_type, next_token_type, next_action_type, seq_feat, pos_feat, neg_feat
             )
@@ -133,6 +148,42 @@ if __name__ == '__main__':
                 loss += args.l2_emb * torch.norm(param)
             loss.backward()
             optimizer.step()
+            compute_time_sum += time.time() - compute_start
+
+            # 下一次数据等待起点
+            t_data_wait_start = time.time()
+
+            # 每隔若干步打印与记录缓存命中率与IO时间
+            if global_step % log_interval == 0:
+                # 统计缓存
+                try:
+                    mm_stats = ds._get_mm_cache_stats()#多模态缓存统计
+                except Exception:
+                    mm_stats = {'hit_rate': 0.0, 'entries': 0}
+                item_stats = dataset.get_cache_stats()#物品特征缓存统计
+                user_stats = dataset.get_user_cache_stats()#用户特征缓存统计
+
+                avg_data_time = data_time_sum / log_interval
+                avg_compute_time = compute_time_sum / log_interval
+
+                print(f"[io] step={global_step} avg_data_time={avg_data_time:.4f}s avg_compute_time={avg_compute_time:.4f}s")
+                print(f"[cache] mm_hit={mm_stats.get('hit_rate',0):.2%} entries={mm_stats.get('entries',0)} | "
+                      f"item_hit={item_stats['hit_rate']:.2%} entries={item_stats['item_feat_cache_size']} | "
+                      f"user_hit={user_stats['hit_rate']:.2%} entries={user_stats['entries']}")
+
+                # TensorBoard
+                writer.add_scalar('io/avg_data_time', avg_data_time, global_step)
+                writer.add_scalar('io/avg_compute_time', avg_compute_time, global_step)
+                writer.add_scalar('cache/mm_hit_rate', mm_stats.get('hit_rate',0), global_step)
+                writer.add_scalar('cache/mm_entries', mm_stats.get('entries',0), global_step)
+                writer.add_scalar('cache/item_hit_rate', item_stats['hit_rate'], global_step)
+                writer.add_scalar('cache/item_entries', item_stats['item_feat_cache_size'], global_step)
+                writer.add_scalar('cache/user_hit_rate', user_stats['hit_rate'], global_step)
+                writer.add_scalar('cache/user_entries', user_stats['entries'], global_step)
+
+                # reset window sums
+                data_time_sum = 0.0
+                compute_time_sum = 0.0
 
         model.eval()
         valid_loss_sum = 0
