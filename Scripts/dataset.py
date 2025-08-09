@@ -65,6 +65,13 @@ class MyDataset(torch.utils.data.Dataset):
         self._item_feat_cache = {}  # 物品特征缓存
         self._mm_emb_lookup_cache = {}  # 多模态特征查找缓存
         self._cache_stats = {'hits': 0, 'misses': 0}  # 缓存统计
+        
+        # 用户数据加载LRU缓存（实例级）
+        self._user_cache_enabled = os.environ.get('USER_CACHE_ENABLED', '1') != '0'
+        self._user_cache_max_entries = int(os.environ.get('USER_CACHE_MAX_ENTRIES', '5000'))
+        self._user_cache_readahead = int(os.environ.get('USER_CACHE_READAHEAD', '0'))  # 0=关闭
+        self._user_cache = OrderedDict()  # key: uid -> parsed sequence
+        self._user_cache_stats = {'hits': 0, 'misses': 0}
 
     def _load_data_and_offsets(self):
         """
@@ -76,17 +83,50 @@ class MyDataset(torch.utils.data.Dataset):
 
     def _load_user_data(self, uid):
         """
-        从数据文件中加载单个用户的数据
+        从数据文件中加载单个用户的数据（支持LRU缓存与可选预读）。
 
         Args:
-            uid: 用户ID(reid)
+            uid: 用户在偏移表中的索引（reid）
 
         Returns:
             data: 用户序列数据，格式为[(user_id, item_id, user_feat, item_feat, action_type, timestamp)]
         """
+        # 1) 缓存命中
+        if self._user_cache_enabled and uid in self._user_cache:
+            self._user_cache_stats['hits'] += 1
+            self._user_cache.move_to_end(uid)
+            return self._user_cache[uid]
+
+        self._user_cache_stats['misses'] += 1
+
+        # 2) 读取当前uid
         self.data_file.seek(self.seq_offsets[uid])
         line = self.data_file.readline()
         data = json.loads(line)
+
+        if self._user_cache_enabled:
+            self._user_cache[uid] = data
+            self._user_cache.move_to_end(uid)
+            if len(self._user_cache) > self._user_cache_max_entries:
+                self._user_cache.popitem(last=False)
+
+            # 3) 可选预读：顺序访问时提前加载接下来若干条
+            if self._user_cache_readahead > 0:
+                end_uid = min(uid + 1 + self._user_cache_readahead, len(self.seq_offsets))
+                for pre_uid in range(uid + 1, end_uid):
+                    if pre_uid in self._user_cache:
+                        continue
+                    self.data_file.seek(self.seq_offsets[pre_uid])
+                    pre_line = self.data_file.readline()
+                    try:
+                        pre_data = json.loads(pre_line)
+                    except Exception:
+                        continue
+                    self._user_cache[pre_uid] = pre_data
+                    self._user_cache.move_to_end(pre_uid)
+                    if len(self._user_cache) > self._user_cache_max_entries:
+                        self._user_cache.popitem(last=False)
+
         return data
 
     def _random_neq(self, l, r, s):
@@ -348,6 +388,28 @@ class MyDataset(torch.utils.data.Dataset):
         self._cache_stats = {'hits': 0, 'misses': 0}
         print("缓存已清空")
 
+    def get_user_cache_stats(self):
+        """
+        获取用户数据缓存统计信息
+        """
+        total = self._user_cache_stats['hits'] + self._user_cache_stats['misses']
+        hit_rate = self._user_cache_stats['hits'] / total if total else 0.0
+        return {
+            'hit_rate': hit_rate,
+            'entries': len(self._user_cache),
+            'hits': self._user_cache_stats['hits'],
+            'misses': self._user_cache_stats['misses'],
+            'readahead': self._user_cache_readahead,
+            'enabled': self._user_cache_enabled
+        }
+
+    def clear_user_cache(self):
+        """
+        清空用户数据缓存并重置统计
+        """
+        self._user_cache.clear()
+        self._user_cache_stats = {'hits': 0, 'misses': 0}
+
     @staticmethod
     def collate_fn(batch):
         """
@@ -493,7 +555,7 @@ class MyTestDataset(MyDataset):
             seq: 用户序列ID, torch.Tensor形式
             token_type: 用户序列类型, torch.Tensor形式
             seq_feat: 用户序列特征, list形式
-            user_id: user_id, str
+            user_id: user_id, str 
         """
         seq, token_type, seq_feat, user_id = zip(*batch)
         seq = torch.from_numpy(np.array(seq))
