@@ -6,6 +6,14 @@ from pathlib import Path
 import numpy as np
 import torch
 from tqdm import tqdm
+from collections import OrderedDict
+import os
+
+# 多模态特征全局LRU缓存（按 (mm_path, feat_id) 粒度）
+_MM_CACHE_ENABLED = os.environ.get('MM_CACHE_ENABLED', '1') != '0'
+_MM_CACHE_MAX_ENTRIES = int(os.environ.get('MM_CACHE_MAX_ENTRIES', '12'))
+_MM_CACHE = OrderedDict()  # key: (abs_mm_path, feat_id) -> emb_dict
+_MM_CACHE_STATS = {'hits': 0, 'misses': 0}
 
 class MyDataset(torch.utils.data.Dataset):
     """
@@ -511,9 +519,26 @@ def save_emb(emb, save_path):
         emb.tofile(f)
 
 
+def _get_mm_cache_stats():
+    total = _MM_CACHE_STATS['hits'] + _MM_CACHE_STATS['misses']
+    hit_rate = _MM_CACHE_STATS['hits'] / total if total else 0.0
+    return {
+        'hit_rate': hit_rate,
+        'entries': len(_MM_CACHE),
+        'hits': _MM_CACHE_STATS['hits'],
+        'misses': _MM_CACHE_STATS['misses']
+    }
+
+
+def _clear_mm_cache():
+    _MM_CACHE.clear()
+    _MM_CACHE_STATS['hits'] = 0
+    _MM_CACHE_STATS['misses'] = 0
+
+
 def load_mm_emb(mm_path, feat_ids):
     """
-    加载多模态特征Embedding
+    加载多模态特征Embedding（带全局LRU缓存，可通过环境变量开关）。
 
     Args:
         mm_path: 多模态特征Embedding路径
@@ -524,26 +549,49 @@ def load_mm_emb(mm_path, feat_ids):
     """
     SHAPE_DICT = {"81": 32, "82": 1024, "83": 3584, "84": 4096, "85": 3584, "86": 3584}
     mm_emb_dict = {}
+    abs_mm_path = str(Path(mm_path).resolve())
+
     for feat_id in tqdm(feat_ids, desc='Loading mm_emb'):
-        shape = SHAPE_DICT[feat_id]
-        emb_dict = {}
-        if feat_id != '81':
-            try:
-                base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
-                for json_file in base_path.glob('*.json'):
-                    with open(json_file, 'r', encoding='utf-8') as file:
-                        for line in file:
-                            data_dict_origin = json.loads(line.strip())
-                            insert_emb = data_dict_origin['emb']
-                            if isinstance(insert_emb, list):
-                                insert_emb = np.array(insert_emb, dtype=np.float32)
-                            data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
-                            emb_dict.update(data_dict)
-            except Exception as e:
-                print(f"transfer error: {e}")
-        if feat_id == '81':
-            with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
-                emb_dict = pickle.load(f)
+        cache_key = (abs_mm_path, feat_id)
+        emb_dict = None
+
+        # 1) 先查缓存
+        if _MM_CACHE_ENABLED and cache_key in _MM_CACHE:
+            _MM_CACHE_STATS['hits'] += 1
+            _MM_CACHE.move_to_end(cache_key)
+            emb_dict = _MM_CACHE[cache_key]
+        else:
+            if _MM_CACHE_ENABLED:
+                _MM_CACHE_STATS['misses'] += 1
+            # 2) 读盘
+            shape = SHAPE_DICT[feat_id]
+            emb_dict = {}
+            if feat_id != '81':
+                try:
+                    base_path = Path(mm_path, f'emb_{feat_id}_{shape}')
+                    for json_file in base_path.glob('*.json'):
+                        with open(json_file, 'r', encoding='utf-8') as file:
+                            for line in file:
+                                data_dict_origin = json.loads(line.strip())
+                                insert_emb = data_dict_origin['emb']
+                                if isinstance(insert_emb, list):
+                                    insert_emb = np.array(insert_emb, dtype=np.float32)
+                                data_dict = {data_dict_origin['anonymous_cid']: insert_emb}
+                                emb_dict.update(data_dict)
+                except Exception as e:
+                    print(f"transfer error: {e}")
+            if feat_id == '81':#81是特殊情况，直接读取pkl文件
+                with open(Path(mm_path, f'emb_{feat_id}_{shape}.pkl'), 'rb') as f:
+                    emb_dict = pickle.load(f)
+
+            # 3) 写入缓存与容量控制
+            if _MM_CACHE_ENABLED:
+                _MM_CACHE[cache_key] = emb_dict
+                _MM_CACHE.move_to_end(cache_key)
+                if len(_MM_CACHE) > _MM_CACHE_MAX_ENTRIES:
+                    _MM_CACHE.popitem(last=False)
+
         mm_emb_dict[feat_id] = emb_dict
         print(f'Loaded #{feat_id} mm_emb')
+
     return mm_emb_dict
